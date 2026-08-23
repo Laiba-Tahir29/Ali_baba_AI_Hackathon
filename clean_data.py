@@ -2,7 +2,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-df = pd.read_csv("dataset/cardio_data.csv")
+df = pd.read_csv("dataset/cardio_data.csv", sep=";")
 
 for col in df.columns:
     if df[col].dtype in ["int64", "float64"]:
