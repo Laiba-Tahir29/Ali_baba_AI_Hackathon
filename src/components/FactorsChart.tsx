@@ -1,6 +1,6 @@
 import React from "react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Cell } from "recharts";
-import { BarChart3, Info } from "lucide-react";
+import { BarChart3, CheckCircle } from "lucide-react";
 
 interface FactorsChartProps {
   topFactors: string[];
@@ -8,13 +8,31 @@ interface FactorsChartProps {
 }
 
 export const FactorsChart: React.FC<FactorsChartProps> = ({ topFactors, riskLevel = "high" }) => {
-  // Normalize data for chart visualization
-  const chartData = (topFactors || ["Blood Pressure", "Cholesterol", "Family History"]).map((factor, index) => {
-    // Relative impact weighting for top factors (highest impact first)
+  const normalizedFactors = Array.isArray(topFactors) ? topFactors.filter(Boolean) : [];
+
+  // FIX 3: Empty state when no factors found
+  if (normalizedFactors.length === 0) {
+    return (
+      <div className="bg-white rounded-2xl border border-[#e1e3e4] p-5 sm:p-6 shadow-[0_4px_20px_rgba(0,0,0,0.04)] h-full flex flex-col items-center justify-center">
+        <div className="text-center">
+          <CheckCircle className="w-8 h-8 text-emerald-600 mx-auto mb-3" />
+          <p className="text-sm text-slate-600 font-medium">
+            No elevated risk factors identified
+          </p>
+          <p className="text-xs text-slate-500 mt-1">
+            All measured parameters are within normal range.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Normal chart rendering when factors exist
+  const chartData = normalizedFactors.slice(0, 3).map((factor, index) => {
     const impactValues = [42, 33, 25];
     const impact = impactValues[index] || 20;
 
-    let color = "#00685f"; // default teal
+    let color = "#00685f";
     if (index === 0) color = riskLevel === "high" ? "#ba1a1a" : riskLevel === "medium" ? "#b05e3d" : "#00685f";
     if (index === 1) color = riskLevel === "high" ? "#b05e3d" : "#00685f";
     if (index === 2) color = "#008378";

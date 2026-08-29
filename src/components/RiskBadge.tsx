@@ -16,11 +16,28 @@ interface RiskBadgeProps {
 
 export const RiskBadge: React.FC<RiskBadgeProps> = ({ risk, patientMeta, onNewAnalysis }) => {
   const [showTooltip, setShowTooltip] = useState(false);
-  const config = RISK_CONFIG[risk.risk_level] || RISK_CONFIG.high;
+  const riskLevelKey = (risk.risk_level || "high").toLowerCase() as RiskLevel;
+
+  const config = RISK_CONFIG[riskLevelKey] || RISK_CONFIG.high;
+
+
+
+  
 
   const handlePrint = () => {
     window.print();
   };
+
+  // FIX 1: Format risk_score percentage correctly
+  const riskScoreValue = Number(risk.risk_score ?? 0);
+  const formattedRiskScore =
+    Number.isFinite(riskScoreValue)
+      ? `${(riskScoreValue > 1 ? riskScoreValue : riskScoreValue * 100).toFixed(1).replace(/\.0$/, "")}%`
+      : "0%";
+  
+  // FIX 2: Show "None" when no primary factor exists
+  const primaryFactor =
+    risk.top_3_factors?.[0] || risk.top_factors?.[0] || "None — no elevated factors";
 
   return (
     <div className="w-full bg-white rounded-2xl border border-[#e1e3e4] p-5 sm:p-6 shadow-[0_4px_20px_rgba(0,0,0,0.04)] mb-6">
@@ -66,11 +83,11 @@ export const RiskBadge: React.FC<RiskBadgeProps> = ({ risk, patientMeta, onNewAn
           <div className="flex items-center gap-2 flex-wrap">
             <div className="px-3 py-1.5 rounded-lg bg-slate-100 border border-slate-200 text-xs text-slate-700">
               <span className="text-slate-500">Calculated Score:</span>{" "}
-              <span className="font-bold text-[#191c1d]">{risk.risk_score}%</span>
+              <span className="font-bold text-[#191c1d]">{formattedRiskScore}</span>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
               <span className="text-slate-500">Primary driver:</span>{" "}
-              <span className="font-semibold text-[#191c1d]">{risk.top_3_factors[0] || "Blood Pressure"}</span>
+              <span className="font-semibold text-[#191c1d]">{primaryFactor}</span>
             </div>
           </div>
         </div>

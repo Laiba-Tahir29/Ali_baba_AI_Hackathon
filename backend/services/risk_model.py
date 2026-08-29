@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -670,362 +669,159 @@ def _filter_actual_factors(
 # MAIN PREDICTION
 # ============================================================
 
-def predict_risk(
-    consolidated_profile: Any,
-):
+FEATURE_COLUMNS = MODEL_FEATURES
 
-    print(
-        "\n" + "=" * 60
-    )
+CORE_FIELDS = [
+    "age",
+    "ap_hi",
+    "ap_lo",
+    "cholesterol",
+]
 
-    print(
-        "[Risk Model] "
-        "Starting risk prediction"
-    )
+SUPPLEMENTARY_DEFAULTS = {
+    "gender": 1,
+    "height": 165,
+    "weight": 70,
+    "gluc": 1,
+    "smoke": 0,
+    "alco": 0,
+    "active": 1,
+}
 
-    print(
-        "=" * 60
-    )
+RISK_THRESHOLDS = {
+    "Low":33,
+    "Medium":66,
+}
 
-    # ========================================================
-    # 1. LOAD MODEL
-    # ========================================================
+_model_cache = None
 
-    model = _load_model()
 
-    # ========================================================
-    # 2. LOAD IMPUTATION VALUES
-    # ========================================================
+def _get_model():
+    global _model_cache
+    if _model_cache is None:
+        _model_cache = _load_model()
+    return _model_cache
 
-    imputation_values = (
-        _load_imputation_values()
-    )
 
-    # ========================================================
-    # 3. EXTRACT ACTUAL PATIENT VALUES
-    # ========================================================
+def _age_years_to_days(age_years):
+    if age_years is None:
+        return None
+    return round(age_years * 365.25)
 
-    original_values = _profile_to_features(
-        consolidated_profile
-    )
 
-    # IMPORTANT:
-    # Keep this dictionary untouched.
-    #
-    # It represents REAL extracted patient information.
-    #
-    # None means:
-    # "The report did not provide this value."
+def _is_missing(value):
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    return False
 
-    print(
-        "[Risk Model] "
-        "Extracted feature values:"
-    )
 
-    for feature in MODEL_FEATURES:
+def _is_abnormal(field, value):
+    if value is None:
+        return False
+    if field == "ap_hi":
+        return value > 130
+    if field == "ap_lo":
+        return value > 85
+    if field in ("cholesterol", "gluc"):
+        return value in (2, 3)
+    if field == "smoke":
+        return value == 1
+    if field == "alco":
+        return value == 1
+    if field == "active":
+        return value == 0
+    if field == "age":
+        return value >= 55
+    return False
 
-        print(
-            f"    {feature}: "
-            f"{original_values.get(feature)}"
-        )
 
-    # ========================================================
-    # 4. IDENTIFY MISSING VALUES
-    # ========================================================
+def _get_top_factors(model, profile, max_factors=3):
+    importances = dict(zip(FEATURE_COLUMNS, model.feature_importances_))
 
-    missing_fields = []
+    candidates = [
+        field for field in FEATURE_COLUMNS
+        if _is_abnormal(field, profile.get(field))
+    ]
+    candidates.sort(key=lambda f: importances.get(f, 0), reverse=True)
 
-    for feature in MODEL_FEATURES:
+    if candidates:
+        return candidates[:max_factors]
 
-        if original_values.get(feature) is None:
+    return []
 
-            missing_fields.append(
-                DISPLAY_NAMES.get(
-                    feature,
-                    feature,
-                )
-            )
 
-    # ========================================================
-    # 5. CREATE SEPARATE ML VALUES
-    # ========================================================
-    #
-    # DO NOT modify original_values.
-    #
-    # This is the key fix.
-    #
-    # original_values:
-    #     Actual patient data.
-    #
-    # model_values:
-    #     Actual patient data + training imputation.
-    #
-    # ========================================================
-
-    model_values = dict(
-        original_values
-    )
-
-    imputed_fields = []
-
-    for feature in MODEL_FEATURES:
-
-        if model_values.get(feature) is None:
-
-            model_values[feature] = (
-                imputation_values[feature]
-            )
-
-            imputed_fields.append(
-                DISPLAY_NAMES.get(
-                    feature,
-                    feature,
-                )
-            )
-
-    # ========================================================
-    # 6. BUILD MODEL INPUT
-    # ========================================================
-
-    X = pd.DataFrame(
-        [
-            [
-                model_values[feature]
-                for feature in MODEL_FEATURES
-            ]
-        ],
-        columns=MODEL_FEATURES,
-    )
-
-    print(
-        "[Risk Model] "
-        "Final model input:"
-    )
-
-    print(
-        X.to_string(
-            index=False
-        )
-    )
-
-    # ========================================================
-    # 7. PREDICT PROBABILITY
-    # ========================================================
-
-    probability_array = (
-        model.predict_proba(X)
-    )
-
-    classes = list(
-        model.classes_
-    )
-
-    if 1 in classes:
-
-        positive_index = classes.index(1)
-
+def predict_risk(final_profile):
+    """
+    Public interface matching the requested missing-data policy.
+    """
+    if hasattr(final_profile, "model_dump"):
+        profile = final_profile.model_dump()
+    elif isinstance(final_profile, dict):
+        profile = dict(final_profile)
     else:
+        profile = dict(final_profile)
 
-        positive_index = len(classes) - 1
-
-    probability = float(
-        probability_array[
-            0,
-            positive_index,
-        ]
-    )
-
-    risk_score = round(
-        probability * 100,
-        1,
-    )
-
-    # ========================================================
-    # 8. RISK LEVEL
-    # ========================================================
-
-    risk_level = _risk_level(
-        risk_score
-    )
-
-    # ========================================================
-    # 9. SHAP
-    # ========================================================
-
-    all_shap_details = _calculate_shap(
-        model,
-        X,
-    )
-
-    # IMPORTANT:
-    #
-    # SHAP was calculated using the actual model input,
-    # which may contain imputed values.
-    #
-    # Therefore we must NOT blindly present every SHAP
-    # feature as an observed clinical factor.
-    #
-
-    actual_shap_details = _filter_actual_factors(
-        all_shap_details,
-        original_values,
-    )
-
-    # ========================================================
-    # 10. TOP FACTORS
-    # ========================================================
-
-    top_actual = actual_shap_details[:3]
-
-    top_factors = [
-        item["feature"]
-        for item in top_actual
-    ]
-
-    top_3_factors = [
-        item["name"]
-        for item in top_actual
-    ]
-
-    # ========================================================
-    # 11. FALLBACK IF SHAP IS UNAVAILABLE
-    # ========================================================
-
-    if not top_3_factors:
-
-        # If no actual features are available,
-        # do not invent risk factors.
-
-        top_3_factors = []
-
-        top_factors = []
-
-    # ========================================================
-    # 12. DATA SUFFICIENCY
-    # ========================================================
-
-    available_count = sum(
-        value is not None
-        for value in original_values.values()
-    )
-
-    required_core_features = [
-        "age",
-        "ap_hi",
-        "ap_lo",
-    ]
-
-    core_available = all(
-        original_values.get(feature) is not None
-        for feature in required_core_features
-    )
-
-    insufficient_data = (
-        not core_available
-    )
-
-    # ========================================================
-    # 13. MESSAGE
-    # ========================================================
-
-    if imputed_fields:
-
-        message = (
-            "Risk calculated using the trained "
-            "Random Forest model. Missing features "
-            "were imputed internally using "
-            "training-data statistics. "
-            "Imputed values are not treated as "
-            "observed patient measurements."
-        )
-
-    else:
-
-        message = (
-            "Risk calculated using the trained "
-            "Random Forest model using extracted "
-            "patient data."
-        )
-
-    # ========================================================
-    # 14. FINAL RESULT
-    # ========================================================
-
-    result = {
-
-        "risk_score":
-            risk_score,
-
-        "risk_level":
-            risk_level,
-
-        "top_3_factors":
-            top_3_factors,
-
-        "top_factors":
-            top_factors,
-
-        "shap_details":
-            actual_shap_details,
-
-        "insufficient_data":
-            insufficient_data,
-
-        "missing_fields":
-            missing_fields,
-
-        "imputed_fields":
-            imputed_fields,
-
-        "available_feature_count":
-            available_count,
-
-        "message":
-            message,
+    core_values = {
+        "age": profile.get("age"),
+        "ap_hi": profile.get("ap_hi"),
+        "ap_lo": profile.get("ap_lo"),
+        "cholesterol": profile.get("cholesterol"),
     }
 
-    # ========================================================
-    # 15. DEBUG OUTPUT
-    # ========================================================
+    missing_core = [
+        key for key in CORE_FIELDS if _is_missing(core_values.get(key))
+    ]
 
-    print(
-        "[Risk Model] "
-        f"Risk Score: {risk_score}%"
-    )
+    if missing_core:
+        return {
+            "status": "insufficient_data",
+            "missing_fields": missing_core,
+            "message": (
+                "Cannot calculate a reliable risk score — the uploaded "
+                f"report(s) did not include: {', '.join(missing_core)}. "
+                "These are essential values; please upload a report that "
+                "includes them."
+            ),
+        }
 
-    print(
-        "[Risk Model] "
-        f"Risk Level: {risk_level}"
-    )
+    row = dict(core_values)
+    imputed_fields = []
 
-    print(
-        "[Risk Model] "
-        f"Actual Top Factors: {top_3_factors}"
-    )
+    for field, default in SUPPLEMENTARY_DEFAULTS.items():
+        value = profile.get(field)
+        if _is_missing(value):
+            row[field] = default
+            imputed_fields.append(field)
+        else:
+            row[field] = value
 
-    print(
-        "[Risk Model] "
-        f"Missing Fields: {missing_fields}"
-    )
+    row["age"] = _age_years_to_days(row["age"])
 
-    print(
-        "[Risk Model] "
-        f"Internally Imputed Fields: "
-        f"{imputed_fields}"
-    )
+    model = _get_model()
+    feature_vector = pd.DataFrame([row], columns=FEATURE_COLUMNS)
+    risk_score = float(model.predict_proba(feature_vector)[0][1])*100
 
-    print(
-        "=" * 60
-    )
+    if risk_score < RISK_THRESHOLDS["Low"]:
+        risk_level = "Low"
+    elif risk_score < RISK_THRESHOLDS["Medium"]:
+        risk_level = "Medium"
+    else:
+        risk_level = "High"
 
-    print(
-        "[Risk Model] "
-        "Prediction completed"
-    )
+    top_factors = _get_top_factors(model, profile)
 
-    print(
-        "=" * 60
-    )
-
-    return result
-
+    return {
+        "status": "ok",
+        "risk_score": round(risk_score, 4),
+        "risk_level": risk_level,
+        "top_factors": top_factors,
+        "top_3_factors": top_factors[:3],
+        "imputed_fields": imputed_fields,
+    }

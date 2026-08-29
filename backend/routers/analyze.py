@@ -140,54 +140,107 @@ async def analyze_patient(
         # RANDOM FOREST
         # ====================================================
 
+     # ====================================================
+# STEP 4
+# RANDOM FOREST
+# ====================================================
+
+        print("\n[DEBUG] Calling predict_risk()...")
+
         risk_output = predict_risk(
             consolidated
         )
 
+        print("\n[DEBUG] predict_risk() returned:")
+        print(risk_output)
+
+        print(
+            "[DEBUG] risk_score =",
+            risk_output.get("risk_score")
+        )
+
+        print(
+            "[DEBUG] risk_level =",
+            risk_output.get("risk_level")
+        )
+
+        print(
+            "[DEBUG] top_3_factors =",
+            risk_output.get("top_3_factors")
+        )
+
         # ====================================================
         # STEP 5
-        # RAG EVIDENCE
+        # RAG EVIDENCE & EXPLANATION
+        # FIX 2: Continue processing even on insufficient_data
         # ====================================================
 
-        top_factors = risk_output.get(
-            "top_3_factors",
-            [],
-        )
-
-        query = (
-            "cardiovascular risk factors "
-            + ", ".join(top_factors)
-            + " blood pressure cholesterol glucose"
-        )
-
-        rag_evidence = (
-            retrieve_relevant_evidence_chunks(
-                rag_store,
-                query=query,
-                top_k=3,
+        if risk_output.get("status") == "insufficient_data":
+            # Still run RAG and explanation even without a score
+            query = "cardiovascular health factors blood pressure cholesterol glucose"
+            
+            rag_evidence = (
+                retrieve_relevant_evidence_chunks(
+                    rag_store,
+                    query=query,
+                    top_k=3,
+                )
             )
-        )
-
-        # ====================================================
-        # STEP 6
-        # LLM EXPLANATION
-        # ====================================================
-
-        explanation_text = (
-            generate_explanation(
-                risk_data=risk_output,
-
-                consistent_high_factors=(
-                    consolidated.consistent_high_factors
-                ),
-
-                evidence=(
-                    rag_evidence
-                    if rag_evidence
-                    else raw_profiles
-                ),
+            
+            explanation_text = (
+                generate_explanation(
+                    risk_data=risk_output,
+                    consistent_high_factors=(
+                        consolidated.consistent_high_factors
+                    ),
+                    evidence=(
+                        rag_evidence
+                        if rag_evidence
+                        else raw_profiles
+                    ),
+                )
             )
-        )
+        else:
+            top_factors = (
+                risk_output.get("top_factors")
+                or risk_output.get("top_3_factors")
+                or []
+            )
+
+            query = (
+                "cardiovascular risk factors "
+                + ", ".join(top_factors)
+                + " blood pressure cholesterol glucose"
+            )
+
+            rag_evidence = (
+                retrieve_relevant_evidence_chunks(
+                    rag_store,
+                    query=query,
+                    top_k=3,
+                )
+            )
+
+            # ====================================================
+            # STEP 6
+            # LLM EXPLANATION
+            # ====================================================
+
+            explanation_text = (
+                generate_explanation(
+                    risk_data=risk_output,
+
+                    consistent_high_factors=(
+                        consolidated.consistent_high_factors
+                    ),
+
+                    evidence=(
+                        rag_evidence
+                        if rag_evidence
+                        else raw_profiles
+                    ),
+                )
+            )
 
         # ====================================================
         # REPORT ITEMS
@@ -273,7 +326,11 @@ async def analyze_patient(
         # FINAL RESPONSE
         # ====================================================
 
+        status_value = risk_output.get("status")
+
         return AnalysisResponse(
+
+            status=status_value,
 
             reports=report_items,
 
@@ -286,6 +343,12 @@ async def analyze_patient(
             explanation=explanation_text,
 
             patient_meta=patient_meta,
+
+            missing_fields=risk_output.get("missing_fields", []),
+
+            imputed_fields=risk_output.get("imputed_fields", []),
+
+            message=risk_output.get("message"),
         )
 
     except HTTPException:
@@ -303,11 +366,6 @@ async def analyze_patient(
         )
 
         raise HTTPException(
-
             status_code=500,
-
-            detail=(
-                "Clinical analysis pipeline error: "
-                f"{str(exc)}"
-            ),
+            detail="Clinical analysis pipeline error",
         )

@@ -1093,10 +1093,10 @@ def _extract_with_gemini(
         return None
 
     model_names = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-flash-latest",
+        "gemini-3.6-flash",
+
     ]
+     
 
     for model_name in model_names:
 
