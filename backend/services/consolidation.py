@@ -1,500 +1,364 @@
 """
-Layer 3: Profile Consolidation, Longitudinal Consistency & Anomaly Detection
+Layer 3: Clinical Profile Consolidation
 
-Owner: Person B (rag-llm branch)
+Purpose:
+    Consolidate multiple extracted medical encounters into one
+    latest-valid patient profile.
 
-Performs clinical reconciliation across multi-encounter reports:
-
-1. LLM Consolidation (Gemini) when GEMINI_API_KEY is available:
-   - Reconciles conflicting records
-   - Extracts latest valid values
-   - Detects longitudinal trends
-   - Flags anomalies
-
-2. Deterministic Fallback:
-   - Sorts encounters by date
-   - Extracts latest non-null values
-   - Standardizes categories
-   - Identifies consistently elevated factors
-
-IMPORTANT:
-- No fake clinical defaults.
-- Missing values remain None / "Unknown".
-- Missing smoking does NOT become "no".
-- Missing history does NOT become "no".
-- Missing BMI does NOT become a fabricated value.
+Rules:
+    - Missing values ALWAYS remain None.
+    - Never invent clinical defaults.
+    - Latest available value is selected per field.
+    - Persistent high factors are calculated only from
+      actually reported values.
+    - Anomalies are calculated only when both compared
+      values actually exist.
+    - ALWAYS return a FinalProfile Pydantic object.
 """
 
-import os
-import json
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Dict, Any, Optional
+
+from ..models.schemas import FinalProfile
 
 
 # ============================================================
-# DATE PARSING
+# HELPERS
 # ============================================================
 
-def _parse_date(value: Any) -> Optional[datetime]:
+def _to_dict(profile: Any) -> Dict[str, Any]:
+    """Convert Pydantic model/dict/object to dictionary."""
+
+    if profile is None:
+        return {}
+
+    if isinstance(profile, dict):
+        return dict(profile)
+
+    if hasattr(profile, "model_dump"):
+        return profile.model_dump()
+
+    if hasattr(profile, "dict"):
+        return profile.dict()
+
+    try:
+        return vars(profile)
+    except Exception:
+        return {}
+
+
+def _is_valid(value: Any) -> bool:
+    """
+    A value is valid only if it is actually present.
+
+    None and empty strings are considered missing.
+    Zero is a valid value.
+    """
+
     if value is None:
-        return None
+        return False
 
-    date_str = str(value).strip()
+    if isinstance(value, str):
+        return bool(value.strip())
 
-    if not date_str:
-        return None
+    return True
 
-    formats = [
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%m/%d/%Y",
-        "%d %B %Y",
-        "%d %b %Y",
-        "%B %d, %Y",
-        "%b %d, %Y",
-        "%Y/%m/%d",
-    ]
 
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
+def _latest_valid(
+    reports: List[Dict[str, Any]],
+    field: str,
+) -> Any:
+    """
+    Return the newest non-missing value.
 
+    Reports are expected to be in chronological/document order.
+    """
+
+    for report in reversed(reports):
+
+        value = report.get(field)
+
+        if _is_valid(value):
+            return value
+
+    # IMPORTANT:
+    # Never create a default value.
     return None
 
 
-# ============================================================
-# TYPE COERCION
-# ============================================================
+def _numeric(value: Any) -> Optional[float]:
+    """Safely convert a value to float."""
 
-def _coerce_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-
-    try:
-        return int(float(value))
-    except (ValueError, TypeError):
-        return None
-
-
-def _coerce_float(value: Any) -> Optional[float]:
     if value is None:
         return None
 
     try:
         return float(value)
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return None
 
 
-def _yes_no_to_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-
-    s = str(value).strip().lower()
-
-    if s in ("yes", "y", "1", "true", "positive"):
-        return 1
-
-    if s in ("no", "n", "0", "false", "negative"):
-        return 0
-
-    return None
-
-
 # ============================================================
-# CLINICAL HIGH-VALUE CHECKS
+# CONSISTENT HIGH FACTORS
 # ============================================================
 
-def _is_high_cholesterol(value: Any) -> bool:
+def _high_factor_names(
+    reports: List[Dict[str, Any]]
+) -> List[str]:
     """
-    Cholesterol:
-    1 = Normal
-    2 = Above Normal
-    3 = Well Above Normal
+    Detect factors that are high in every encounter where
+    that factor was actually reported.
 
-    Raw values:
-    >= 200 = elevated
-    >= 240 = well above
+    Missing values are completely ignored.
+
+    Example:
+
+        Report 1 cholesterol = None
+        Report 2 cholesterol = 225
+        Report 3 cholesterol = 252
+
+    Cholesterol is NOT marked consistently high because
+    there are not at least two valid cholesterol observations.
     """
 
-    if value is None:
-        return False
+    if len(reports) < 2:
+        return []
 
-    numeric = _coerce_int(value)
+    high_counts = {
+        "ap_hi": 0,
+        "ap_lo": 0,
+        "cholesterol": 0,
+        "gluc": 0,
+    }
 
-    if numeric in (2, 3):
-        return True
+    valid_counts = {
+        "ap_hi": 0,
+        "ap_lo": 0,
+        "cholesterol": 0,
+        "gluc": 0,
+    }
 
-    s = str(value).strip().lower()
+    for report in reports:
 
-    if "above" in s or "high" in s:
-        return True
+        # ----------------------------------------------------
+        # SYSTOLIC
+        # ----------------------------------------------------
 
-    try:
-        val = float(
-            s.replace("mg/dl", "")
-             .replace("mg/dL", "")
-             .strip()
+        ap_hi = _numeric(report.get("ap_hi"))
+
+        if ap_hi is not None:
+
+            valid_counts["ap_hi"] += 1
+
+            if ap_hi >= 140:
+                high_counts["ap_hi"] += 1
+
+        # ----------------------------------------------------
+        # DIASTOLIC
+        # ----------------------------------------------------
+
+        ap_lo = _numeric(report.get("ap_lo"))
+
+        if ap_lo is not None:
+
+            valid_counts["ap_lo"] += 1
+
+            if ap_lo >= 90:
+                high_counts["ap_lo"] += 1
+
+        # ----------------------------------------------------
+        # CHOLESTEROL
+        #
+        # 1 = Normal
+        # 2 = Above Normal
+        # 3 = Well Above Normal
+        # ----------------------------------------------------
+
+        cholesterol = _numeric(
+            report.get("cholesterol")
         )
 
-        return val >= 200.0
+        if cholesterol is not None:
 
-    except (ValueError, TypeError):
-        return False
+            valid_counts["cholesterol"] += 1
 
+            if cholesterol >= 2:
+                high_counts["cholesterol"] += 1
 
-def _is_high_gluc(value: Any) -> bool:
-    """
-    Glucose:
-    1 = Normal
-    2 = Above Normal
-    3 = Well Above Normal
+        # ----------------------------------------------------
+        # GLUCOSE
+        #
+        # 1 = Normal
+        # 2 = Above Normal
+        # 3 = Well Above Normal
+        # ----------------------------------------------------
 
-    Raw fasting glucose:
-    >= 100 = elevated
-    >= 126 = well above
-    """
-
-    if value is None:
-        return False
-
-    numeric = _coerce_int(value)
-
-    if numeric in (2, 3):
-        return True
-
-    s = str(value).strip().lower()
-
-    if "above" in s or "high" in s:
-        return True
-
-    try:
-        val = float(
-            s.replace("mg/dl", "")
-             .replace("mg/dL", "")
-             .strip()
+        gluc = _numeric(
+            report.get("gluc")
         )
 
-        return val >= 100.0
+        if gluc is not None:
 
-    except (ValueError, TypeError):
-        return False
+            valid_counts["gluc"] += 1
 
+            if gluc >= 2:
+                high_counts["gluc"] += 1
 
-def _is_high_ap_hi(value: Any) -> bool:
-    """
-    Systolic BP >= 130 is considered elevated
-    for this application's risk-factor flagging.
-    """
+    # --------------------------------------------------------
+    # Persistent high factor
+    #
+    # Require:
+    #   - at least 2 actual observations
+    #   - every available observation is high
+    #
+    # Missing observations are NOT treated as normal.
+    # --------------------------------------------------------
 
-    if value is None:
-        return False
+    display_names = {
+        "ap_hi": "Systolic Blood Pressure",
+        "ap_lo": "Diastolic Blood Pressure",
+        "cholesterol": "Cholesterol",
+        "gluc": "Fasting Glucose",
+    }
 
-    numeric = _coerce_int(value)
+    factors = []
 
-    if numeric is not None:
-        return numeric >= 130
+    for field in display_names:
 
-    try:
-        bp_str = str(value).strip()
+        valid = valid_counts[field]
+        high = high_counts[field]
 
-        if "/" in bp_str:
-            systolic = int(bp_str.split("/")[0].strip())
-            return systolic >= 130
+        if valid >= 2 and high == valid:
 
-    except (ValueError, TypeError):
-        pass
+            factors.append(
+                display_names[field]
+            )
 
-    return False
+    return factors
 
 
 # ============================================================
-# CATEGORY FORMATTING
+# ANOMALY DETECTION
 # ============================================================
 
-def _format_category(
-    value: Any,
-    default_label: str = "Unknown"
-) -> str:
+def _detect_anomalies(
+    reports: List[Dict[str, Any]]
+) -> List[str]:
     """
-    Converts cholesterol/glucose values into display labels.
+    Detect sudden changes between consecutive encounters.
 
-    Missing values remain Unknown.
+    Missing values are ignored.
     """
 
-    if value is None:
-        return default_label
+    if len(reports) < 2:
+        return []
 
-    s = str(value).strip().lower()
+    anomalies = []
 
-    if "well above" in s or s == "3":
-        return "Well Above Normal"
+    def add_once(message: str):
 
-    if "above" in s or s == "2":
-        return "Above Normal"
+        if message not in anomalies:
+            anomalies.append(message)
 
-    if "normal" in s or s == "1":
-        return "Normal"
+    for previous, current in zip(
+        reports,
+        reports[1:]
+    ):
 
-    try:
-        val = float(
-            s.replace("mg/dl", "")
-             .replace("mg/dL", "")
-             .strip()
+        # ----------------------------------------------------
+        # SYSTOLIC BP
+        # ----------------------------------------------------
+
+        old_value = _numeric(
+            previous.get("ap_hi")
         )
 
-        if val >= 240:
-            return "Well Above Normal"
+        new_value = _numeric(
+            current.get("ap_hi")
+        )
 
-        if val >= 200:
-            return "Above Normal"
+        if (
+            old_value is not None
+            and new_value is not None
+        ):
 
-        return "Normal"
+            if abs(new_value - old_value) >= 30:
 
-    except (ValueError, TypeError):
-        return str(value)
-
-
-# ============================================================
-# GEMINI CONSOLIDATION
-# ============================================================
-
-def _llm_consolidate(
-    profiles_list: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    """
-    Uses Gemini to reconcile multiple clinical encounters.
-
-    If Gemini fails or is unavailable, caller uses deterministic
-    fallback.
-    """
-
-    gemini_key = os.getenv("GEMINI_API_KEY")
-
-    if not gemini_key or gemini_key.startswith("your_"):
-        return None
-
-    for model_name in [
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-flash-latest",
-    ]:
-
-        try:
-            from google import genai
-
-            client = genai.Client(api_key=gemini_key)
-
-            prompt = (
-                "You are a clinical data reconciliation assistant. "
-                "Reconcile the following historical medical encounter "
-                "reports into ONE consolidated patient profile.\n\n"
-
-                "RULES:\n"
-                "1. Use the latest valid value when multiple encounters "
-                "contain the same field.\n"
-                "2. Never invent or estimate missing clinical values.\n"
-                "3. If a field was never reported, return null.\n"
-                "4. Missing smoking must remain null/unknown.\n"
-                "5. Missing family history must remain null/unknown.\n"
-                "6. Missing BMI must remain null.\n"
-                "7. Detect consistently elevated factors.\n"
-                "8. Detect contradictory or unusual findings.\n\n"
-
-                f"REPORTS JSON:\n"
-                f"{json.dumps(profiles_list, indent=2, default=str)}\n\n"
-
-                "Return ONLY a valid JSON object with these keys:\n"
-
-                "- age: int or null\n"
-                "- gender: 1=female, 2=male, or null\n"
-                "- height: float cm or null\n"
-                "- weight: float kg or null\n"
-
-                "- ap_hi: int systolic BP or null\n"
-                "- ap_lo: int diastolic BP or null\n"
-                "- bp: string such as '150/95' or null\n"
-
-                "- cholesterol: "
-                "'Normal', 'Above Normal', 'Well Above Normal', "
-                "or 'Unknown'\n"
-
-                "- gluc: 1, 2, 3, or null\n"
-
-                "- glucose: "
-                "'Normal', 'Above Normal', 'Well Above Normal', "
-                "or 'Unknown'\n"
-
-                "- bmi: float or null\n"
-
-                "- smoke: 0, 1, or null\n"
-                "- smoking: 'yes', 'no', or 'unknown'\n"
-
-                "- alco: 0, 1, or null\n"
-                "- active: 0, 1, or null\n"
-
-                "- history: 'yes', 'no', or 'unknown'\n"
-
-                "- consistent_high_factors: list of strings\n"
-
-                "- anomalies_flagged: list of strings\n"
-            )
-
-            res = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-
-            if not res or not res.text:
-                continue
-
-            clean = res.text.strip()
-
-            # Remove markdown JSON fences if Gemini returns them.
-            if clean.startswith("```"):
-                lines = clean.splitlines()
-
-                if lines and lines[0].strip().startswith("```"):
-                    lines = lines[1:]
-
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-
-                clean = "\n".join(lines).strip()
-
-            parsed = json.loads(clean)
-
-            if not isinstance(parsed, dict):
-                continue
-
-            # ------------------------------------------------
-            # Normalize Gemini output
-            # ------------------------------------------------
-
-            parsed["age"] = _coerce_int(parsed.get("age"))
-            parsed["gender"] = _coerce_int(parsed.get("gender"))
-
-            parsed["height"] = _coerce_float(
-                parsed.get("height")
-            )
-
-            parsed["weight"] = _coerce_float(
-                parsed.get("weight")
-            )
-
-            parsed["ap_hi"] = _coerce_int(
-                parsed.get("ap_hi")
-            )
-
-            parsed["ap_lo"] = _coerce_int(
-                parsed.get("ap_lo")
-            )
-
-            # BMI must stay None if missing.
-            parsed["bmi"] = _coerce_float(
-                parsed.get("bmi")
-            )
-
-            parsed["gluc"] = _coerce_int(
-                parsed.get("gluc")
-            )
-
-            parsed["smoke"] = _yes_no_to_int(
-                parsed.get("smoke")
-            )
-
-            parsed["alco"] = _yes_no_to_int(
-                parsed.get("alco")
-            )
-
-            parsed["active"] = _yes_no_to_int(
-                parsed.get("active")
-            )
-
-            history_value = parsed.get("history")
-
-            if history_value is None:
-                parsed["history"] = "unknown"
-            else:
-                history_int = _yes_no_to_int(history_value)
-
-                if history_int == 1:
-                    parsed["history"] = "yes"
-                elif history_int == 0:
-                    parsed["history"] = "no"
-                else:
-                    parsed["history"] = "unknown"
-
-            # Smoking formatting
-            if parsed["smoke"] == 1:
-                parsed["smoking"] = "yes"
-            elif parsed["smoke"] == 0:
-                parsed["smoking"] = "no"
-            else:
-                parsed["smoking"] = "unknown"
-
-            # BP formatting
-            if (
-                parsed["ap_hi"] is not None
-                and parsed["ap_lo"] is not None
-            ):
-                parsed["bp"] = (
-                    f"{parsed['ap_hi']}/{parsed['ap_lo']}"
+                add_once(
+                    "Sudden change in "
+                    "Systolic Blood Pressure"
                 )
-            else:
-                parsed["bp"] = None
 
-            # Cholesterol formatting
-            parsed["cholesterol"] = _format_category(
-                parsed.get("cholesterol"),
-                "Unknown"
-            )
+        # ----------------------------------------------------
+        # DIASTOLIC BP
+        # ----------------------------------------------------
 
-            # Glucose formatting
-            parsed["glucose"] = _format_category(
-                parsed.get("glucose")
-                if parsed.get("glucose") is not None
-                else parsed.get("gluc"),
-                "Unknown"
-            )
+        old_value = _numeric(
+            previous.get("ap_lo")
+        )
 
-            if not isinstance(
-                parsed.get("consistent_high_factors"),
-                list
-            ):
-                parsed["consistent_high_factors"] = []
+        new_value = _numeric(
+            current.get("ap_lo")
+        )
 
-            if not isinstance(
-                parsed.get("anomalies_flagged"),
-                list
-            ):
-                parsed["anomalies_flagged"] = []
+        if (
+            old_value is not None
+            and new_value is not None
+        ):
 
-            print(
-                "[Stage 3: LLM Consolidation] "
-                f"Status: [LIVE GEMINI - {model_name}]"
-            )
+            if abs(new_value - old_value) >= 20:
 
-            print(
-                "[Stage 3] Anomalies:",
-                parsed.get("anomalies_flagged", [])
-            )
+                add_once(
+                    "Sudden change in "
+                    "Diastolic Blood Pressure"
+                )
 
-            return parsed
+        # ----------------------------------------------------
+        # CHOLESTEROL CATEGORY
+        # ----------------------------------------------------
 
-        except Exception as e:
+        old_value = _numeric(
+            previous.get("cholesterol")
+        )
 
-            print(
-                "[Stage 3 Notice] "
-                f"Gemini consolidation attempt "
-                f"{model_name}: {e}"
-            )
+        new_value = _numeric(
+            current.get("cholesterol")
+        )
 
-    return None
+        if (
+            old_value is not None
+            and new_value is not None
+        ):
+
+            if old_value != new_value:
+
+                add_once(
+                    "Change in Cholesterol category"
+                )
+
+        # ----------------------------------------------------
+        # GLUCOSE CATEGORY
+        # ----------------------------------------------------
+
+        old_value = _numeric(
+            previous.get("gluc")
+        )
+
+        new_value = _numeric(
+            current.get("gluc")
+        )
+
+        if (
+            old_value is not None
+            and new_value is not None
+        ):
+
+            if old_value != new_value:
+
+                add_once(
+                    "Change in Glucose category"
+                )
+
+    return anomalies
 
 
 # ============================================================
@@ -502,511 +366,290 @@ def _llm_consolidate(
 # ============================================================
 
 def consolidate_profiles(
-    profiles_list: List[Dict[str, Any]]
-) -> Dict[str, Any]:
+    profiles: List[Any]
+) -> FinalProfile:
     """
-    Consolidates per-report profiles into one final profile.
+    Consolidate extracted medical encounters.
 
-    Priority:
-        1. Gemini reconciliation
-        2. Deterministic fallback
+    ALWAYS returns FinalProfile.
 
-    IMPORTANT:
-        Missing clinical values remain None.
-        No fabricated clinical defaults are used.
+    Missing values remain None.
     """
-
-    # ========================================================
-    # EMPTY INPUT
-    # ========================================================
-
-    if not profiles_list:
-
-        return {
-            "age": None,
-            "gender": None,
-
-            "height": None,
-            "weight": None,
-
-            "ap_hi": None,
-            "ap_lo": None,
-            "bp": None,
-
-            "cholesterol": "Unknown",
-
-            "gluc": None,
-            "glucose": "Unknown",
-
-            "bmi": None,
-
-            "smoke": None,
-            "smoking": "unknown",
-
-            "alco": None,
-            "active": None,
-
-            "history": "unknown",
-
-            "consistent_high_factors": [],
-            "anomalies_flagged": [],
-        }
-
-    # ========================================================
-    # 1. GEMINI CONSOLIDATION
-    # ========================================================
-
-    llm_result = _llm_consolidate(profiles_list)
-
-    if llm_result:
-        return llm_result
-
-    # ========================================================
-    # 2. DETERMINISTIC FALLBACK
-    # ========================================================
 
     print(
-        "[Stage 3: LLM Consolidation] "
-        "Status: [FALLBACK DETERMINISTIC ENGINE]"
+        "\n============================================================"
     )
 
-    dated_profiles = [
-        (
-            profile,
-            _parse_date(profile.get("date"))
+    print(
+        "[Consolidation] Starting profile consolidation"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    # --------------------------------------------------------
+    # Empty input
+    # --------------------------------------------------------
+
+    if not profiles:
+
+        print(
+            "[Consolidation] No profiles supplied."
         )
-        for profile in profiles_list
-    ]
 
-    dated_profiles.sort(
-        key=lambda item: (
-            item[1]
-            if item[1] is not None
-            else datetime.min
-        ),
-        reverse=True
-    )
+        return FinalProfile()
 
-    sorted_profiles = [
-        profile
-        for profile, _ in dated_profiles
-    ]
+    # --------------------------------------------------------
+    # Convert input to dictionaries
+    # --------------------------------------------------------
 
-    # ========================================================
-    # LATEST NON-NULL VALUE
-    # ========================================================
+    reports: List[Dict[str, Any]] = []
 
-    def latest_value(
-        field: str,
-        transform=None
-    ):
-        for profile in sorted_profiles:
+    for profile in profiles:
 
-            if field not in profile:
-                continue
+        data = _to_dict(profile)
 
-            value = profile.get(field)
+        if data:
+            reports.append(data)
 
-            if value is None:
-                continue
+    if not reports:
 
-            if transform is not None:
-                value = transform(value)
+        print(
+            "[Consolidation] No valid report objects found."
+        )
 
-            if value is not None:
-                return value
+        return FinalProfile()
 
-        return None
-
-    # ========================================================
-    # DEMOGRAPHICS
-    # ========================================================
-
-    age = latest_value(
-        "age",
-        _coerce_int
-    )
-
-    gender = latest_value(
-        "gender",
-        _coerce_int
-    )
-
-    height = latest_value(
-        "height",
-        _coerce_float
-    )
-
-    weight = latest_value(
-        "weight",
-        _coerce_float
+    print(
+        f"[Consolidation] Processing "
+        f"{len(reports)} encounter(s)."
     )
 
     # ========================================================
-    # BLOOD PRESSURE
+    # LATEST VALID VALUES
     # ========================================================
 
-    ap_hi = latest_value(
-        "ap_hi",
-        _coerce_int
+    age = _latest_valid(
+        reports,
+        "age"
     )
 
-    ap_lo = latest_value(
-        "ap_lo",
-        _coerce_int
+    gender = _latest_valid(
+        reports,
+        "gender"
     )
 
-    # If ap_hi/ap_lo were not separately extracted,
-    # try BP string as fallback.
-
-    if ap_hi is None or ap_lo is None:
-
-        for profile in sorted_profiles:
-
-            bp_value = profile.get("bp")
-
-            if not bp_value:
-                continue
-
-            try:
-                if "/" in str(bp_value):
-
-                    parts = str(bp_value).split("/")
-
-                    parsed_hi = _coerce_int(
-                        parts[0].strip()
-                    )
-
-                    parsed_lo = _coerce_int(
-                        parts[1].strip()
-                    )
-
-                    if ap_hi is None:
-                        ap_hi = parsed_hi
-
-                    if ap_lo is None:
-                        ap_lo = parsed_lo
-
-                    if (
-                        ap_hi is not None
-                        and ap_lo is not None
-                    ):
-                        break
-
-            except Exception:
-                continue
-
-    bp_formatted = (
-        f"{ap_hi}/{ap_lo}"
-        if ap_hi is not None
-        and ap_lo is not None
-        else None
+    height = _latest_valid(
+        reports,
+        "height"
     )
 
-    # ========================================================
-    # CHOLESTEROL
-    # ========================================================
+    weight = _latest_valid(
+        reports,
+        "weight"
+    )
 
-    cholesterol_raw = latest_value(
+    ap_hi = _latest_valid(
+        reports,
+        "ap_hi"
+    )
+
+    ap_lo = _latest_valid(
+        reports,
+        "ap_lo"
+    )
+
+    bmi = _latest_valid(
+        reports,
+        "bmi"
+    )
+
+    cholesterol = _latest_valid(
+        reports,
         "cholesterol"
     )
 
-    cholesterol_formatted = _format_category(
-        cholesterol_raw,
-        "Unknown"
+    gluc = _latest_valid(
+        reports,
+        "gluc"
     )
 
-    # ========================================================
-    # GLUCOSE
-    # ========================================================
-
-    gluc = latest_value("gluc")
-
-    if gluc is None:
-        gluc = latest_value("glucose")
-
-    glucose_formatted = _format_category(
-        gluc,
-        "Unknown"
+    smoke = _latest_valid(
+        reports,
+        "smoke"
     )
 
-    # ========================================================
-    # BMI
-    # ========================================================
-
-    # First preference:
-    # BMI explicitly reported in document.
-
-    bmi = latest_value(
-        "bmi",
-        _coerce_float
+    alco = _latest_valid(
+        reports,
+        "alco"
     )
 
-    # Only calculate BMI when BOTH height and weight
-    # actually exist.
-
-    if (
-        bmi is None
-        and height is not None
-        and weight is not None
-        and height > 0
-    ):
-
-        bmi = round(
-            weight / ((height / 100.0) ** 2),
-            1
-        )
-
-    # Otherwise BMI stays None.
-    # NEVER use an invented default.
-
-    # ========================================================
-    # SMOKING
-    # ========================================================
-
-    smoke = latest_value(
-        "smoke",
-        _yes_no_to_int
+    active = _latest_valid(
+        reports,
+        "active"
     )
 
-    # Try textual smoking field if numeric field missing.
-
-    if smoke is None:
-
-        smoke = latest_value(
-            "smoking",
-            _yes_no_to_int
-        )
-
-    if smoke == 1:
-        smoking_formatted = "yes"
-
-    elif smoke == 0:
-        smoking_formatted = "no"
-
-    else:
-        smoking_formatted = "unknown"
-
-    # ========================================================
-    # ALCOHOL
-    # ========================================================
-
-    alco = latest_value(
-        "alco",
-        _yes_no_to_int
-    )
-
-    # Missing remains None.
-    # No fake "no" default.
-
-    # ========================================================
-    # PHYSICAL ACTIVITY
-    # ========================================================
-
-    active = latest_value(
-        "active",
-        _yes_no_to_int
-    )
-
-    # Missing remains None.
-
-    # ========================================================
-    # FAMILY HISTORY
-    # ========================================================
-
-    history_raw = latest_value(
+    history = _latest_valid(
+        reports,
         "history"
     )
 
-    history_val = _yes_no_to_int(
-        history_raw
-    )
-
-    if history_val == 1:
-        history_formatted = "yes"
-
-    elif history_val == 0:
-        history_formatted = "no"
-
-    else:
-        history_formatted = "unknown"
-
     # ========================================================
-    # LONGITUDINAL CONSISTENCY
+    # DISPLAY FIELDS
     # ========================================================
 
-    n = len(profiles_list)
+    # --------------------------------------------------------
+    # Blood pressure display
+    # --------------------------------------------------------
 
-    threshold = n / 2.0
+    bp = None
 
-    high_cholesterol_count = sum(
-        1
-        for profile in profiles_list
-        if _is_high_cholesterol(
-            profile.get("cholesterol")
-        )
-    )
+    if (
+        ap_hi is not None
+        and ap_lo is not None
+    ):
+        bp = f"{ap_hi}/{ap_lo}"
 
-    high_glucose_count = sum(
-        1
-        for profile in profiles_list
-        if _is_high_gluc(
-            profile.get("gluc")
-            if profile.get("gluc") is not None
-            else profile.get("glucose")
-        )
-    )
+    # --------------------------------------------------------
+    # Glucose display
+    # --------------------------------------------------------
 
-    high_bp_count = sum(
-        1
-        for profile in profiles_list
-        if _is_high_ap_hi(
-            profile.get("ap_hi")
-            if profile.get("ap_hi") is not None
-            else profile.get("bp")
-        )
-    )
+    glucose = None
 
-    consistent_high_factors = []
+    gluc_num = _numeric(gluc)
 
-    if high_bp_count > threshold:
-        consistent_high_factors.append(
-            "Systolic Blood Pressure"
+    if gluc_num is not None:
+
+        glucose_map = {
+            1: "Normal",
+            2: "Above Normal",
+            3: "Well Above Normal",
+        }
+
+        glucose = glucose_map.get(
+            int(gluc_num)
         )
 
-    if high_cholesterol_count > threshold:
-        consistent_high_factors.append(
-            "Cholesterol"
-        )
+    # --------------------------------------------------------
+    # Smoking display
+    # --------------------------------------------------------
 
-    if high_glucose_count > threshold:
-        consistent_high_factors.append(
-            "Fasting Glucose"
-        )
+    smoking = None
 
-    # BMI is only flagged when BMI actually exists.
-    if bmi is not None and bmi >= 30.0:
-        consistent_high_factors.append(
-            "Body Mass Index"
-        )
+    smoke_num = _numeric(smoke)
 
-    # Smoking only flagged when explicitly YES.
-    if smoke == 1:
-        consistent_high_factors.append(
-            "Smoking Status"
-        )
+    if smoke_num is not None:
 
-    # Family history only flagged when explicitly YES.
-    if history_val == 1:
-        consistent_high_factors.append(
-            "Family CVD History"
-        )
+        if smoke_num == 1:
+            smoking = "Yes"
+
+        elif smoke_num == 0:
+            smoking = "No"
 
     # ========================================================
-    # BASIC ANOMALY DETECTION
+    # MULTI-ENCOUNTER ANALYSIS
     # ========================================================
 
-    anomalies_flagged = []
-
-    # Detect contradictory smoking values.
-    smoking_values = []
-
-    for profile in profiles_list:
-
-        value = _yes_no_to_int(
-            profile.get("smoke")
+    consistent_high_factors = (
+        _high_factor_names(
+            reports
         )
+    )
 
-        if value is None:
-            value = _yes_no_to_int(
-                profile.get("smoking")
-            )
-
-        if value is not None:
-            smoking_values.append(value)
-
-    if len(set(smoking_values)) > 1:
-        anomalies_flagged.append(
-            "Smoking status differs across encounters"
+    anomalies_flagged = (
+        _detect_anomalies(
+            reports
         )
-
-    # Detect contradictory family history.
-    history_values = []
-
-    for profile in profiles_list:
-
-        value = _yes_no_to_int(
-            profile.get("history")
-        )
-
-        if value is not None:
-            history_values.append(value)
-
-    if len(set(history_values)) > 1:
-        anomalies_flagged.append(
-            "Family cardiovascular history differs across encounters"
-        )
-
-    # Detect significant BP variation.
-    bp_values = []
-
-    for profile in profiles_list:
-
-        value = profile.get("ap_hi")
-
-        if value is None:
-            value = profile.get("bp")
-
-        if value is not None:
-
-            if isinstance(value, str) and "/" in value:
-                value = value.split("/")[0]
-
-            value = _coerce_int(value)
-
-            if value is not None:
-                bp_values.append(value)
-
-    if len(bp_values) >= 2:
-
-        bp_range = max(bp_values) - min(bp_values)
-
-        if bp_range >= 30:
-            anomalies_flagged.append(
-                "Systolic blood pressure shows a substantial variation across encounters"
-            )
+    )
 
     # ========================================================
     # FINAL PROFILE
     # ========================================================
 
-    return {
-        "age": age,
-        "gender": gender,
+    consolidated = FinalProfile(
 
-        "height": height,
-        "weight": weight,
+        age=age,
 
-        "ap_hi": ap_hi,
-        "ap_lo": ap_lo,
-        "bp": bp_formatted,
+        gender=gender,
 
-        "cholesterol": cholesterol_formatted,
+        height=height,
 
-        "gluc": gluc,
-        "glucose": glucose_formatted,
+        weight=weight,
 
-        "bmi": bmi,
+        ap_hi=ap_hi,
 
-        "smoke": smoke,
-        "smoking": smoking_formatted,
+        ap_lo=ap_lo,
 
-        "alco": alco,
-        "active": active,
+        bp=bp,
 
-        "history": history_formatted,
+        cholesterol=cholesterol,
 
-        "consistent_high_factors": consistent_high_factors,
+        gluc=gluc,
 
-        "anomalies_flagged": anomalies_flagged,
-    }
+        glucose=glucose,
+
+        bmi=bmi,
+
+        smoke=smoke,
+
+        smoking=smoking,
+
+        alco=alco,
+
+        active=active,
+
+        history=history,
+
+        consistent_high_factors=(
+            consistent_high_factors
+        ),
+
+        anomalies_flagged=(
+            anomalies_flagged
+        ),
+    )
+
+    # ========================================================
+    # DEBUG
+    # ========================================================
+
+    print(
+        "\n[Consolidation] FINAL PROFILE:"
+    )
+
+    print(
+        consolidated.model_dump()
+    )
+
+    print(
+        "\n[Consolidation] Consistent high factors:",
+        consolidated.consistent_high_factors
+    )
+
+    print(
+        "[Consolidation] Anomalies:",
+        consolidated.anomalies_flagged
+    )
+
+    print(
+        "\n[Consolidation] Completed successfully."
+    )
+
+    print(
+        "============================================================\n"
+    )
+
+    # ========================================================
+    # CRITICAL
+    # ========================================================
+    #
+    # Return the OBJECT, NOT a dictionary.
+    #
+    # analyze.py does:
+    #
+    # consolidated.consistent_high_factors
+    #
+    # Therefore this MUST remain:
+    #
+    return consolidated

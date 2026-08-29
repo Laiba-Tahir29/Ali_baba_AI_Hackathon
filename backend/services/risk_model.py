@@ -1,5 +1,6 @@
+
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import joblib
 import numpy as np
@@ -9,23 +10,6 @@ import pandas as pd
 # ============================================================
 # PATHS
 # ============================================================
-# Project structure:
-#
-# Ali_baba_AI_Hackathon/
-# ├── backend/
-# │   ├── models/
-# │   │   └── cardio_risk_model.pkl
-# │   └── services/
-# │       └── risk_model.py
-# └── processed/
-#     └── imputation_values.csv
-#
-# From:
-# backend/services/risk_model.py
-#
-# parents[0] = services
-# parents[1] = backend
-# parents[2] = project root
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -62,6 +46,10 @@ MODEL_FEATURES = [
 ]
 
 
+# ============================================================
+# DISPLAY NAMES
+# ============================================================
+
 DISPLAY_NAMES = {
     "age": "Age",
     "gender": "Gender",
@@ -82,48 +70,47 @@ DISPLAY_NAMES = {
 # ============================================================
 
 def _load_model():
+
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
             f"Could not find trained model at: {MODEL_PATH}"
         )
 
-    print(f"[Risk Model] Loading model from: {MODEL_PATH}")
+    print(
+        "[Risk Model] Loading model from: "
+        f"{MODEL_PATH}"
+    )
 
     return joblib.load(MODEL_PATH)
 
 
 # ============================================================
-# LOAD TRAINING-DATA IMPUTATION VALUES
+# LOAD TRAINING IMPUTATION VALUES
 # ============================================================
 
 def _load_imputation_values() -> Dict[str, float]:
 
     if not IMPUTATION_PATH.exists():
         raise FileNotFoundError(
-            f"Could not find imputation file at: {IMPUTATION_PATH}"
+            "Could not find imputation file at: "
+            f"{IMPUTATION_PATH}"
         )
 
     df = pd.read_csv(IMPUTATION_PATH)
 
     print(
-        f"[Risk Model] Loading imputation values from: "
+        "[Risk Model] Loading imputation values from: "
         f"{IMPUTATION_PATH}"
-    )
-
-    print(
-        f"[Risk Model] Imputation columns: "
-        f"{list(df.columns)}"
     )
 
     result: Dict[str, float] = {}
 
     # --------------------------------------------------------
-    # Your actual file format:
+    # Standard format:
     #
     # feature,imputation_value
     # age,19701.0
     # gender,1.0
-    # ...
     # --------------------------------------------------------
 
     if (
@@ -147,14 +134,19 @@ def _load_imputation_values() -> Dict[str, float]:
 
             try:
                 result[feature] = float(value)
-            except (TypeError, ValueError):
+
+            except (
+                TypeError,
+                ValueError,
+            ):
                 print(
-                    f"[Risk Model] Invalid imputation "
+                    "[Risk Model] Invalid imputation "
                     f"value for {feature}: {value}"
                 )
 
     # --------------------------------------------------------
-    # Backward compatibility:
+    # Backward-compatible format:
+    #
     # feature,value
     # --------------------------------------------------------
 
@@ -179,18 +171,25 @@ def _load_imputation_values() -> Dict[str, float]:
 
             try:
                 result[feature] = float(value)
-            except (TypeError, ValueError):
+
+            except (
+                TypeError,
+                ValueError,
+            ):
                 pass
 
     # --------------------------------------------------------
-    # Single-row fallback
+    # Single-row format
     # --------------------------------------------------------
 
     else:
 
-        for feature in MODEL_FEATURES:
+        if len(df) > 0:
 
-            if feature in df.columns:
+            for feature in MODEL_FEATURES:
+
+                if feature not in df.columns:
+                    continue
 
                 value = df[feature].iloc[0]
 
@@ -199,11 +198,15 @@ def _load_imputation_values() -> Dict[str, float]:
 
                 try:
                     result[feature] = float(value)
-                except (TypeError, ValueError):
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
                     pass
 
     # --------------------------------------------------------
-    # Verify ALL features exist
+    # Verify all required imputation values
     # --------------------------------------------------------
 
     missing = [
@@ -213,6 +216,7 @@ def _load_imputation_values() -> Dict[str, float]:
     ]
 
     if missing:
+
         raise ValueError(
             "Missing training-data imputation values for: "
             + ", ".join(missing)
@@ -223,6 +227,7 @@ def _load_imputation_values() -> Dict[str, float]:
     )
 
     for feature in MODEL_FEATURES:
+
         print(
             f"    {feature}: {result[feature]}"
         )
@@ -231,10 +236,12 @@ def _load_imputation_values() -> Dict[str, float]:
 
 
 # ============================================================
-# GENERIC NUMERIC NORMALIZATION
+# NUMERIC NORMALIZATION
 # ============================================================
 
-def _numeric_value(value: Any):
+def _numeric_value(
+    value: Any,
+) -> Optional[float]:
 
     if value is None:
         return None
@@ -260,17 +267,21 @@ def _numeric_value(value: Any):
         }:
             return None
 
-        # Remove common units
-        text = text.replace("mg/dl", "")
-        text = text.replace("mmhg", "")
-        text = text.replace("kg", "")
-        text = text.replace("cm", "")
-
-        text = text.strip()
+        text = (
+            text
+            .replace("mg/dl", "")
+            .replace("mmhg", "")
+            .replace("kg/m²", "")
+            .replace("kg/m2", "")
+            .replace("kg", "")
+            .replace("cm", "")
+            .strip()
+        )
 
         return float(text)
 
     except Exception:
+
         return None
 
 
@@ -278,40 +289,35 @@ def _numeric_value(value: Any):
 # GENDER NORMALIZATION
 # ============================================================
 
-def _normalize_gender(value: Any):
+def _normalize_gender(
+    value: Any,
+):
 
     if value is None:
         return None
 
-    # Numeric dataset values
-    try:
+    numeric = _numeric_value(value)
 
-        if isinstance(value, (int, float)):
+    if numeric is not None:
 
-            numeric = int(value)
+        numeric = int(numeric)
 
-            if numeric in (1, 2):
-                return numeric
-
-            if numeric == 0:
-                return 1
-
-    except Exception:
-        pass
+        if numeric in (1, 2):
+            return numeric
 
     text = str(value).strip().lower()
-
-    if text in {
-        "male",
-        "m",
-        "man",
-    }:
-        return 1
 
     if text in {
         "female",
         "f",
         "woman",
+    }:
+        return 1
+
+    if text in {
+        "male",
+        "m",
+        "man",
     }:
         return 2
 
@@ -322,45 +328,28 @@ def _normalize_gender(value: Any):
 # CHOLESTEROL NORMALIZATION
 # ============================================================
 
-def _normalize_cholesterol(value: Any):
+def _normalize_cholesterol(
+    value: Any,
+):
 
     if value is None:
         return None
 
+    # IMPORTANT:
+    # Do not interpret None as normal.
+
+    numeric = _numeric_value(value)
+
+    if numeric is not None:
+
+        numeric_int = int(numeric)
+
+        # Dataset categories
+        if numeric_int in (1, 2, 3):
+            return numeric_int
+
     text = str(value).strip().lower()
 
-    # Dataset-style categorical value
-    try:
-
-        numeric = float(text)
-
-        if numeric in (1, 2, 3):
-            return int(numeric)
-
-    except Exception:
-        pass
-
-    # Actual cholesterol measurement
-    try:
-
-        numeric = float(
-            text
-            .replace("mg/dl", "")
-            .strip()
-        )
-
-        if numeric < 200:
-            return 1
-
-        if numeric < 240:
-            return 2
-
-        return 3
-
-    except Exception:
-        pass
-
-    # Text categories
     if (
         "well above" in text
         or "very high" in text
@@ -375,56 +364,48 @@ def _normalize_cholesterol(value: Any):
     ):
         return 2
 
-    if (
-        "normal" in text
-        or "good" in text
-    ):
-        return 1
+    try:
 
-    return None
+        raw = float(
+            text
+            .replace("mg/dl", "")
+            .strip()
+        )
+
+        if raw < 200:
+            return 1
+
+        if raw < 240:
+            return 2
+
+        return 3
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
 # GLUCOSE NORMALIZATION
 # ============================================================
 
-def _normalize_glucose(value: Any):
+def _normalize_glucose(
+    value: Any,
+):
 
     if value is None:
         return None
 
+    numeric = _numeric_value(value)
+
+    if numeric is not None:
+
+        numeric_int = int(numeric)
+
+        if numeric_int in (1, 2, 3):
+            return numeric_int
+
     text = str(value).strip().lower()
-
-    # Dataset categorical values
-    try:
-
-        numeric = float(text)
-
-        if numeric in (1, 2, 3):
-            return int(numeric)
-
-    except Exception:
-        pass
-
-    # Actual glucose measurement
-    try:
-
-        numeric = float(
-            text
-            .replace("mg/dl", "")
-            .strip()
-        )
-
-        if numeric < 100:
-            return 1
-
-        if numeric < 126:
-            return 2
-
-        return 3
-
-    except Exception:
-        pass
 
     if (
         "well above" in text
@@ -439,35 +420,53 @@ def _normalize_glucose(value: Any):
     ):
         return 2
 
-    if (
-        "normal" in text
-        or "good" in text
-    ):
-        return 1
+    try:
 
-    return None
+        raw = float(
+            text
+            .replace("mg/dl", "")
+            .strip()
+        )
+
+        if raw < 100:
+            return 1
+
+        if raw < 126:
+            return 2
+
+        return 3
+
+    except Exception:
+
+        return None
 
 
 # ============================================================
-# PROFILE → 11 MODEL FEATURES
+# PROFILE → MODEL FEATURES
 # ============================================================
 
-def _profile_to_features(profile: Any):
+def _profile_to_features(
+    profile: Any,
+):
 
-    # Pydantic model
+    # Pydantic v2
     if hasattr(profile, "model_dump"):
+
         data = profile.model_dump()
 
-    # Older Pydantic compatibility
+    # Pydantic v1
     elif hasattr(profile, "dict"):
+
         data = profile.dict()
 
     # Dictionary
     elif isinstance(profile, dict):
+
         data = profile
 
     # Generic object
     else:
+
         data = vars(profile)
 
     values = {
@@ -527,7 +526,9 @@ def _profile_to_features(profile: Any):
 # RISK LEVEL
 # ============================================================
 
-def _risk_level(probability: float):
+def _risk_level(
+    probability: float,
+):
 
     if probability < 30:
         return "low"
@@ -542,7 +543,10 @@ def _risk_level(probability: float):
 # SHAP
 # ============================================================
 
-def _calculate_shap(model, X: pd.DataFrame):
+def _calculate_shap(
+    model,
+    X: pd.DataFrame,
+):
 
     try:
 
@@ -552,21 +556,14 @@ def _calculate_shap(model, X: pd.DataFrame):
 
         shap_values = explainer.shap_values(X)
 
-        # ----------------------------------------------------
-        # Different SHAP versions return different shapes.
-        # Handle all common binary-class RF formats.
-        # ----------------------------------------------------
-
         if isinstance(shap_values, list):
 
             if len(shap_values) > 1:
-
                 values = np.asarray(
                     shap_values[1]
                 )[0]
 
             else:
-
                 values = np.asarray(
                     shap_values[0]
                 )[0]
@@ -579,16 +576,10 @@ def _calculate_shap(model, X: pd.DataFrame):
 
             if values.ndim == 3:
 
-                # samples, features, classes
-                values = values[
-                    0,
-                    :,
-                    -1
-                ]
+                values = values[0, :, -1]
 
             elif values.ndim == 2:
 
-                # samples, features
                 values = values[0]
 
             else:
@@ -599,7 +590,7 @@ def _calculate_shap(model, X: pd.DataFrame):
 
         for feature, value in zip(
             MODEL_FEATURES,
-            values
+            values,
         ):
 
             numeric_value = float(value)
@@ -610,18 +601,19 @@ def _calculate_shap(model, X: pd.DataFrame):
 
                     "name": DISPLAY_NAMES.get(
                         feature,
-                        feature
+                        feature,
                     ),
 
                     "shap_value": round(
                         numeric_value,
-                        6
+                        6,
                     ),
 
                     "direction": (
                         "increases risk"
                         if numeric_value > 0
-                        else "decreases risk"
+                        else
+                        "decreases risk"
                     ),
                 }
             )
@@ -630,7 +622,7 @@ def _calculate_shap(model, X: pd.DataFrame):
             key=lambda item: abs(
                 item["shap_value"]
             ),
-            reverse=True
+            reverse=True,
         )
 
         return result
@@ -638,125 +630,191 @@ def _calculate_shap(model, X: pd.DataFrame):
     except Exception as exc:
 
         print(
-            f"[SHAP Notice] {exc}"
+            "[SHAP Notice] "
+            f"{exc}"
         )
 
         return []
 
 
 # ============================================================
-# MAIN RISK PREDICTION
+# FILTER SHAP TO ACTUAL PATIENT DATA
+# ============================================================
+
+def _filter_actual_factors(
+    shap_details,
+    original_values,
+):
+    """
+    Keep only factors for which the patient actually had
+    extracted clinical data.
+
+    This prevents an imputed value from being presented as
+    an actual patient-specific risk factor.
+    """
+
+    actual = []
+
+    for item in shap_details:
+
+        feature = item["feature"]
+
+        if original_values.get(feature) is not None:
+
+            actual.append(item)
+
+    return actual
+
+
+# ============================================================
+# MAIN PREDICTION
 # ============================================================
 
 def predict_risk(
-    consolidated_profile: Any
+    consolidated_profile: Any,
 ):
 
-    print("\n" + "=" * 60)
-    print("[Risk Model] Starting risk prediction")
-    print("=" * 60)
+    print(
+        "\n" + "=" * 60
+    )
 
-    # --------------------------------------------------------
-    # 1. Load trained Random Forest
-    # --------------------------------------------------------
+    print(
+        "[Risk Model] "
+        "Starting risk prediction"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    # ========================================================
+    # 1. LOAD MODEL
+    # ========================================================
 
     model = _load_model()
 
-    # --------------------------------------------------------
-    # 2. Load training-data imputation values
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. LOAD IMPUTATION VALUES
+    # ========================================================
 
     imputation_values = (
         _load_imputation_values()
     )
 
-    # --------------------------------------------------------
-    # 3. FINAL PROFILE → 11 MODEL FEATURES
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. EXTRACT ACTUAL PATIENT VALUES
+    # ========================================================
 
-    feature_values = (
-        _profile_to_features(
-            consolidated_profile
-        )
+    original_values = _profile_to_features(
+        consolidated_profile
     )
 
+    # IMPORTANT:
+    # Keep this dictionary untouched.
+    #
+    # It represents REAL extracted patient information.
+    #
+    # None means:
+    # "The report did not provide this value."
+
     print(
-        "[Risk Model] Extracted feature values:"
+        "[Risk Model] "
+        "Extracted feature values:"
     )
 
     for feature in MODEL_FEATURES:
 
         print(
             f"    {feature}: "
-            f"{feature_values.get(feature)}"
+            f"{original_values.get(feature)}"
         )
 
-    # --------------------------------------------------------
-    # 4. Detect missing values BEFORE imputation
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. IDENTIFY MISSING VALUES
+    # ========================================================
 
     missing_fields = []
-    imputed_fields = []
 
     for feature in MODEL_FEATURES:
 
-        if feature_values.get(feature) is None:
+        if original_values.get(feature) is None:
 
             missing_fields.append(
                 DISPLAY_NAMES.get(
                     feature,
-                    feature
+                    feature,
                 )
             )
 
-    # --------------------------------------------------------
-    # 5. TRAINING-DATA IMPUTATION
-    # --------------------------------------------------------
+    # ========================================================
+    # 5. CREATE SEPARATE ML VALUES
+    # ========================================================
+    #
+    # DO NOT modify original_values.
+    #
+    # This is the key fix.
+    #
+    # original_values:
+    #     Actual patient data.
+    #
+    # model_values:
+    #     Actual patient data + training imputation.
+    #
+    # ========================================================
+
+    model_values = dict(
+        original_values
+    )
+
+    imputed_fields = []
 
     for feature in MODEL_FEATURES:
 
-        value = feature_values.get(
-            feature
-        )
+        if model_values.get(feature) is None:
 
-        if value is None:
-
-            feature_values[feature] = (
+            model_values[feature] = (
                 imputation_values[feature]
             )
 
             imputed_fields.append(
                 DISPLAY_NAMES.get(
                     feature,
-                    feature
+                    feature,
                 )
             )
 
-    # --------------------------------------------------------
-    # 6. Create DataFrame in EXACT training order
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. BUILD MODEL INPUT
+    # ========================================================
 
     X = pd.DataFrame(
         [
             [
-                feature_values[feature]
+                model_values[feature]
                 for feature in MODEL_FEATURES
             ]
         ],
-        columns=MODEL_FEATURES
+        columns=MODEL_FEATURES,
     )
 
     print(
-        "[Risk Model] Final model input:"
+        "[Risk Model] "
+        "Final model input:"
     )
 
-    print(X.to_string(index=False))
+    print(
+        X.to_string(
+            index=False
+        )
+    )
 
-    # --------------------------------------------------------
-    # 7. Random Forest probability
-    # --------------------------------------------------------
+    # ========================================================
+    # 7. PREDICT PROBABILITY
+    # ========================================================
 
-    probability_array = model.predict_proba(X)
+    probability_array = (
+        model.predict_proba(X)
+    )
 
     classes = list(
         model.classes_
@@ -768,100 +826,206 @@ def predict_risk(
 
     else:
 
-        # Fallback: last class
         positive_index = len(classes) - 1
 
     probability = float(
         probability_array[
             0,
-            positive_index
+            positive_index,
         ]
     )
 
     risk_score = round(
         probability * 100,
-        1
+        1,
     )
 
-    # --------------------------------------------------------
-    # 8. Risk level
-    # --------------------------------------------------------
+    # ========================================================
+    # 8. RISK LEVEL
+    # ========================================================
 
     risk_level = _risk_level(
         risk_score
     )
 
-    # --------------------------------------------------------
-    # 9. SHAP explanations
-    # --------------------------------------------------------
+    # ========================================================
+    # 9. SHAP
+    # ========================================================
 
-    shap_details = _calculate_shap(
+    all_shap_details = _calculate_shap(
         model,
-        X
+        X,
     )
+
+    # IMPORTANT:
+    #
+    # SHAP was calculated using the actual model input,
+    # which may contain imputed values.
+    #
+    # Therefore we must NOT blindly present every SHAP
+    # feature as an observed clinical factor.
+    #
+
+    actual_shap_details = _filter_actual_factors(
+        all_shap_details,
+        original_values,
+    )
+
+    # ========================================================
+    # 10. TOP FACTORS
+    # ========================================================
+
+    top_actual = actual_shap_details[:3]
 
     top_factors = [
         item["feature"]
-        for item in shap_details[:3]
+        for item in top_actual
     ]
 
     top_3_factors = [
         item["name"]
-        for item in shap_details[:3]
+        for item in top_actual
     ]
 
-    # --------------------------------------------------------
-    # 10. Final output
-    # --------------------------------------------------------
+    # ========================================================
+    # 11. FALLBACK IF SHAP IS UNAVAILABLE
+    # ========================================================
 
-    result = {
+    if not top_3_factors:
 
-        "risk_score": risk_score,
+        # If no actual features are available,
+        # do not invent risk factors.
 
-        "risk_level": risk_level,
+        top_3_factors = []
 
-        "top_3_factors": top_3_factors,
+        top_factors = []
 
-        "top_factors": top_factors,
+    # ========================================================
+    # 12. DATA SUFFICIENCY
+    # ========================================================
 
-        "shap_details": shap_details,
+    available_count = sum(
+        value is not None
+        for value in original_values.values()
+    )
 
-        "insufficient_data": False,
+    required_core_features = [
+        "age",
+        "ap_hi",
+        "ap_lo",
+    ]
 
-        "missing_fields": missing_fields,
+    core_available = all(
+        original_values.get(feature) is not None
+        for feature in required_core_features
+    )
 
-        "imputed_fields": imputed_fields,
+    insufficient_data = (
+        not core_available
+    )
 
-        "message": (
+    # ========================================================
+    # 13. MESSAGE
+    # ========================================================
+
+    if imputed_fields:
+
+        message = (
             "Risk calculated using the trained "
-            "Random Forest model. Missing model "
-            "features were imputed using "
-            "training-data statistics."
-            if imputed_fields
-            else
+            "Random Forest model. Missing features "
+            "were imputed internally using "
+            "training-data statistics. "
+            "Imputed values are not treated as "
+            "observed patient measurements."
+        )
+
+    else:
+
+        message = (
             "Risk calculated using the trained "
             "Random Forest model using extracted "
             "patient data."
-        ),
+        )
+
+    # ========================================================
+    # 14. FINAL RESULT
+    # ========================================================
+
+    result = {
+
+        "risk_score":
+            risk_score,
+
+        "risk_level":
+            risk_level,
+
+        "top_3_factors":
+            top_3_factors,
+
+        "top_factors":
+            top_factors,
+
+        "shap_details":
+            actual_shap_details,
+
+        "insufficient_data":
+            insufficient_data,
+
+        "missing_fields":
+            missing_fields,
+
+        "imputed_fields":
+            imputed_fields,
+
+        "available_feature_count":
+            available_count,
+
+        "message":
+            message,
     }
 
+    # ========================================================
+    # 15. DEBUG OUTPUT
+    # ========================================================
+
     print(
-        f"[Risk Model] Risk Score: "
-        f"{risk_score}%"
+        "[Risk Model] "
+        f"Risk Score: {risk_score}%"
     )
 
     print(
-        f"[Risk Model] Risk Level: "
-        f"{risk_level}"
+        "[Risk Model] "
+        f"Risk Level: {risk_level}"
     )
 
     print(
-        f"[Risk Model] Top Factors: "
-        f"{top_3_factors}"
+        "[Risk Model] "
+        f"Actual Top Factors: {top_3_factors}"
     )
 
-    print("=" * 60)
-    print("[Risk Model] Prediction completed")
-    print("=" * 60)
+    print(
+        "[Risk Model] "
+        f"Missing Fields: {missing_fields}"
+    )
+
+    print(
+        "[Risk Model] "
+        f"Internally Imputed Fields: "
+        f"{imputed_fields}"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "[Risk Model] "
+        "Prediction completed"
+    )
+
+    print(
+        "=" * 60
+    )
 
     return result
+

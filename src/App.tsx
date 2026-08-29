@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, motion, useReducedMotion, Variants } from "framer-motion";
 import { ClinicalHeader } from "./components/ClinicalHeader";
 import { UploadCard } from "./components/UploadCard";
 import { LoadingState } from "./components/LoadingState";
@@ -14,6 +14,7 @@ import { CLINICAL_DISCLAIMER } from "./config/constants";
 import { AnalysisResponse, ViewState, ErrorDetails } from "./types/clinical";
 import { ShieldCheck, Info, HeartPulse } from "lucide-react";
 
+
 export default function App() {
   const [viewState, setViewState] = useState<ViewState>("upload");
   const [currentFile, setCurrentFile] = useState<File | null>(null);
@@ -24,7 +25,7 @@ export default function App() {
 
   // Page view transition variants: short fade + 8-12px vertical slide (~220ms, easeOut)
   // Crossfade only when prefers-reduced-motion is active
-  const pageVariants = {
+  const pageVariants: Variants = {
     initial: {
       opacity: 0,
       y: shouldReduceMotion ? 0 : 10,
@@ -46,6 +47,7 @@ export default function App() {
       },
     },
   };
+    
 
   const runAnalysisPipeline = async (file: File) => {
     setCurrentFile(file);
