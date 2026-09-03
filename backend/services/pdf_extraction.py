@@ -26,9 +26,13 @@ IMPORTANT:
 import os
 import re
 import json
-import pytesseract
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:
+    pytesseract = None
+    Image = None
 
-from PIL import Image
 from typing import List, Dict, Any, Optional
 
 import pymupdf
