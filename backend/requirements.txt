@@ -18,3 +18,7 @@ anthropic>=0.30.0
 
 # Database Persistence (Supabase)
 supabase>=2.0.0
+
+pytesseract>=0.3.10
+pillow>=10.0.0
+
