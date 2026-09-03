@@ -4,13 +4,15 @@ Layer 1 & 2: Document Processing & Medical Profile Extraction
 Pipeline:
 
 PDF
- ↓
+  ↓
 PyMuPDF text extraction
- ↓
+  ↓
+Tesseract OCR fallback for scanned PDFs
+  ↓
 Gemini structured extraction
- ↓
+  ↓
 Deterministic regex validation/recovery
- ↓
+  ↓
 Final per-report profiles
 
 IMPORTANT:
@@ -24,6 +26,9 @@ IMPORTANT:
 import os
 import re
 import json
+import pytesseract
+
+from PIL import Image
 from typing import List, Dict, Any, Optional
 
 import pymupdf
@@ -35,9 +40,16 @@ import pymupdf
 
 def extract_raw_text_from_pdf(pdf_path: str) -> str:
     """
-    Extract machine-readable text from the actual uploaded PDF.
+    Extract text from the actual uploaded PDF.
 
-    Image-only/scanned PDFs require OCR and are not handled here.
+    Primary:
+    - PyMuPDF machine-readable text extraction
+
+    Fallback:
+    - Tesseract OCR for scanned/image-only PDFs
+
+    Existing machine-readable PDFs continue through
+    the original extraction path.
     """
 
     if not pdf_path or not os.path.exists(pdf_path):
@@ -52,6 +64,10 @@ def extract_raw_text_from_pdf(pdf_path: str) -> str:
         doc.close()
         return "[ERROR] PDF has no pages."
 
+    # ========================================================
+    # EXISTING PDF TEXT EXTRACTION
+    # ========================================================
+
     pages = []
 
     for page_number, page in enumerate(doc, start=1):
@@ -65,15 +81,107 @@ def extract_raw_text_from_pdf(pdf_path: str) -> str:
                 f"--- Page {page_number} ---\n{text}"
             )
 
-    doc.close()
+    # ========================================================
+    # NORMAL TEXT PDF
+    # Keep existing behavior exactly the same.
+    # ========================================================
 
-    if not pages:
+    if pages:
+        doc.close()
+        return "\n\n".join(pages)
+
+    # ========================================================
+    # OCR FALLBACK
+    # Only reached when NO machine-readable text was found.
+    # ========================================================
+
+    print(
+        "[Stage 1: PDF Extraction] "
+        "No machine-readable text found. "
+        "Starting OCR fallback..."
+    )
+
+    ocr_pages = []
+
+    try:
+        # Windows default Tesseract installation path
+        if os.name == "nt":
+            tesseract_path = (
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            )
+
+            if os.path.exists(tesseract_path):
+                pytesseract.pytesseract.tesseract_cmd = (
+                    tesseract_path
+                )
+
+        # OCR each PDF page
+        for page_number, page in enumerate(doc, start=1):
+            try:
+                # Render PDF page as an image
+                matrix = pymupdf.Matrix(2, 2)
+
+                pix = page.get_pixmap(
+                    matrix=matrix,
+                    alpha=False
+                )
+
+                # Convert rendered PDF page to PIL image
+                image = Image.frombytes(
+                    "RGB",
+                    [pix.width, pix.height],
+                    pix.samples
+                )
+
+                # Run Tesseract OCR
+                ocr_text = pytesseract.image_to_string(
+                    image,
+                    lang="eng"
+                ).strip()
+
+                if ocr_text:
+                    ocr_pages.append(
+                        f"--- Page {page_number} ---\n{ocr_text}"
+                    )
+
+            except Exception as page_exc:
+                print(
+                    f"[Stage 1 OCR] "
+                    f"Page {page_number} failed: {page_exc}"
+                )
+
+        doc.close()
+
+    except pytesseract.pytesseract.TesseractNotFoundError:
+        doc.close()
+
         return (
-            "[ERROR] No machine-readable text found in PDF. "
-            "The PDF may be scanned/image-only and require OCR."
+            "[ERROR] Tesseract OCR is not installed "
+            "or could not be found."
         )
 
-    return "\n\n".join(pages)
+    except Exception as exc:
+        doc.close()
+
+        return f"[ERROR] OCR processing failed: {exc}"
+
+    # ========================================================
+    # OCR RESULT
+    # Send OCR text into the EXISTING pipeline.
+    # ========================================================
+
+    if not ocr_pages:
+        return (
+            "[ERROR] OCR completed but no readable text "
+            "was found in the scanned PDF."
+        )
+
+    print(
+        "[Stage 1 OCR] "
+        "OCR completed successfully."
+    )
+
+    return "\n\n".join(ocr_pages)
 
 
 # ============================================================
@@ -695,12 +803,14 @@ def parse_reports_with_regex(
             )
 
         # Narrative family history
+        # Narrative family history
         if history is None:
-
             family_pattern = re.search(
                 r"\b(?:father|mother|parent|brother|sister)\b"
                 r".{0,150}?"
-                r"\b(?:heart\s+attack|cardiovascular|CVD|stroke|heart\s+disease)\b",
+                r"\b(?:heart\s+attack|cardiovascular|CVD|stroke|heart\s+disease|"
+                r"diabetes|hypertension|high\s+blood\s+pressure|"
+                r"high\s+cholesterol|cholesterol)\b",
                 sec,
                 re.IGNORECASE,
             )
@@ -744,7 +854,6 @@ def parse_reports_with_regex(
         )
 
         for line in sec.splitlines():
-
             line = line.strip()
 
             if not line:
@@ -763,8 +872,8 @@ def parse_reports_with_regex(
             snippet = " ".join(
                 narrative_lines
             )
-        else:
 
+        else:
             bp_display = (
                 f"{ap_hi}/{ap_lo}"
                 if ap_hi is not None
@@ -892,7 +1001,6 @@ def _merge_missing_fields(
     for index, gemini_report in enumerate(
         gemini_reports
     ):
-
         report = dict(gemini_report)
 
         regex_report = (
@@ -902,7 +1010,6 @@ def _merge_missing_fields(
         )
 
         for field in fields:
-
             gemini_value = report.get(field)
             regex_value = regex_report.get(field)
 
@@ -986,7 +1093,10 @@ def _merge_missing_fields(
             report.get("history")
         )
 
+        # ----------------------------------------------------
         # Derived display values
+        # ----------------------------------------------------
+
         if (
             report.get("ap_hi") is not None
             and report.get("ap_lo") is not None
@@ -1000,8 +1110,10 @@ def _merge_missing_fields(
 
         if report.get("smoke") == 1:
             report["smoking"] = "yes"
+
         elif report.get("smoke") == 0:
             report["smoking"] = "no"
+
         else:
             report["smoking"] = None
 
@@ -1017,7 +1129,6 @@ def _merge_missing_fields(
         # ----------------------------------------------------
 
         if not report.get("snippet"):
-
             clinic = (
                 report.get("clinic")
                 or "Clinical Facility"
@@ -1092,16 +1203,15 @@ def _extract_with_gemini(
         )
         return None
 
+    # Fast, low-latency Gemini model.
+    # Do not change gemini-embedding-001 elsewhere;
+    # that is used for RAG embeddings, not text extraction.
     model_names = [
-        "gemini-3.6-flash",
-
+        "gemini-3.5-flash-lite",
     ]
-     
 
     for model_name in model_names:
-
         try:
-
             from google import genai
 
             client = genai.Client(
@@ -1120,51 +1230,63 @@ STRICT RULES:
 5. Extract EVERY separate medical encounter.
 6. Preserve the actual date, doctor, and clinic.
 7. Extract BMI only when explicitly present.
+
 8. Cholesterol:
    - < 200 = 1
    - 200-239 = 2
    - >= 240 = 3
+
 9. Glucose:
    - < 100 = 1
    - 100-125 = 2
    - >= 126 = 3
+
 10. Do not confuse age with other numbers.
+
 11. Extract family cardiovascular history only when explicitly stated.
+
 12. Do not create medical information.
 
 Gender:
+
 1 = female
 2 = male
 null = not reported
 
 Cholesterol:
+
 1 = normal
 2 = above normal
 3 = well above normal
 null = not reported
 
 Glucose:
+
 1 = normal
 2 = above normal
 3 = well above normal
 null = not reported
 
 Smoking:
+
 0 = no
 1 = yes
 null = not reported
 
 Alcohol:
+
 0 = no
 1 = yes
 null = not reported
 
 Physical activity:
+
 0 = no
 1 = yes
 null = not reported
 
 History:
+
 "yes"
 "no"
 null
@@ -1240,7 +1362,6 @@ DOCUMENT:
                 isinstance(parsed, list)
                 and parsed
             ):
-
                 print(
                     "[Stage 1: PDF Extraction] "
                     f"Gemini succeeded using "
@@ -1250,7 +1371,6 @@ DOCUMENT:
                 return parsed
 
         except Exception as exc:
-
             print(
                 "[Stage 1 Notice] "
                 f"Gemini {model_name} failed: "
@@ -1274,6 +1394,8 @@ def extract_profile(
       ↓
     PyMuPDF
       ↓
+    OCR fallback if scanned
+      ↓
     Regex validation
       ↓
     Gemini
@@ -1284,7 +1406,7 @@ def extract_profile(
 
     PDF
       ↓
-    PyMuPDF
+    PyMuPDF / OCR
       ↓
     Regex
 
@@ -1325,7 +1447,9 @@ def extract_profile(
     print(
         "\n========== RAW PDF TEXT =========="
     )
+
     print(raw_text[:5000])
+
     print(
         "==================================\n"
     )
@@ -1367,7 +1491,6 @@ def extract_profile(
     # --------------------------------------------------------
 
     if gemini_reports:
-
         final_reports = _merge_missing_fields(
             gemini_reports,
             regex_reports,
@@ -1380,7 +1503,6 @@ def extract_profile(
         )
 
     else:
-
         final_reports = regex_reports
 
         print(

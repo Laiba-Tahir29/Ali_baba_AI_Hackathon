@@ -144,8 +144,9 @@ def _generate_with_gemini(
     # --------------------------------------------------------
     # Try available Gemini models
     # --------------------------------------------------------
+
     model_names = [
-    "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
     ]
 
     for model_name in model_names:
